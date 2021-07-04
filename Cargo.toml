@@ -4,7 +4,6 @@ version = "0.1.0"
 authors = ["Igor Skokov"]
 edition = "2018"
 license = "MIT"
-license-file="LICENSE"
 readme = "README.md"
 repository = "https://github.com/Lagrang/mwcas"
 documentation = "https://docs.rs/mwcas"
