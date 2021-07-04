@@ -1,0 +1,22 @@
+[package]
+name = "mwcas"
+version = "0.1.0"
+authors = ["Igor Skokov"]
+edition = "2018"
+license = "MIT"
+license-file="LICENSE"
+readme = "README.md"
+repository = "https://github.com/Lagrang/mwcas"
+documentation = "https://docs.rs/mwcas"
+description = "Multi-word CAS primitive."
+keywords = ["cas", "concurrency", "multi-word"]
+categories = ["concurrency"]
+include = ["src/", "LICENSE", "README.md", "CHANGELOG.md"]
+
+[dependencies]
+crossbeam-epoch = "0.9.4"
+
+[dev-dependencies]
+crossbeam-utils = "0.8.4"
+num_cpus = "1.11.1"
+rand = "0.8.3"
