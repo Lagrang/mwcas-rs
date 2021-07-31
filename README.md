@@ -8,7 +8,7 @@ Rust standard library provides atomic types in
 to atomically update value of one pointer. Many concurrent data
 structures usually requires atomic update for more than 1 pointer at
 time. For example,
-[`BzTree`](http://www.vldb.org/pvldb/vol11/p553-arulraj.pdf).
+BzTree described in [`paper`](http://www.vldb.org/pvldb/vol11/p553-arulraj.pdf)([implementation](https://github.com/Lagrang/bztree-rs) in Rust).
 
 This crate provides concurrency primitive called `MwCas` which can
 atomically update several pointers at time. It is based on paper
