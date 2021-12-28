@@ -7,7 +7,7 @@ use rand::prelude::*;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
-const CAS_OPS: usize = 100_000;
+const CAS_OPS: usize = 80_000;
 
 #[test]
 fn test_on_all_logical_threads_with_dataset_contention() {
@@ -33,10 +33,8 @@ fn test_on_doubled_logical_threads_no_dataset_contention() {
 fn test_on_many_logical_threads_no_dataset_contention() {
     run_multi_threaded(num_cpus::get() * 4, num_cpus::get() * 50, CAS_OPS);
     run_multi_threaded(num_cpus::get() * 8, num_cpus::get() * 50, CAS_OPS);
-    run_multi_threaded(num_cpus::get() * 12, num_cpus::get() * 50, CAS_OPS);
     run_multi_threaded(num_cpus::get() * 4, num_cpus::get() * 100, CAS_OPS);
     run_multi_threaded(num_cpus::get() * 8, num_cpus::get() * 100, CAS_OPS);
-    run_multi_threaded(num_cpus::get() * 12, num_cpus::get() * 100, CAS_OPS);
 }
 
 #[test]
@@ -44,7 +42,6 @@ fn test_on_doubled_logical_threads_with_dataset_contention() {
     run_multi_threaded(num_cpus::get() * 2, num_cpus::get(), CAS_OPS);
     run_multi_threaded(num_cpus::get() * 2, num_cpus::get() * 2, CAS_OPS);
     run_multi_threaded(num_cpus::get() * 2, num_cpus::get() * 4, CAS_OPS);
-    run_multi_threaded(num_cpus::get() * 2, num_cpus::get() * 8, CAS_OPS);
 }
 
 #[test]
@@ -52,11 +49,9 @@ fn test_on_many_logical_threads_with_dataset_contention() {
     run_multi_threaded(num_cpus::get() * 4, num_cpus::get(), CAS_OPS);
     run_multi_threaded(num_cpus::get() * 4, num_cpus::get() * 2, CAS_OPS);
     run_multi_threaded(num_cpus::get() * 4, num_cpus::get() * 4, CAS_OPS);
-    run_multi_threaded(num_cpus::get() * 4, num_cpus::get() * 8, CAS_OPS);
     run_multi_threaded(num_cpus::get() * 8, num_cpus::get(), CAS_OPS);
     run_multi_threaded(num_cpus::get() * 8, num_cpus::get() * 2, CAS_OPS);
     run_multi_threaded(num_cpus::get() * 8, num_cpus::get() * 4, CAS_OPS);
-    run_multi_threaded(num_cpus::get() * 8, num_cpus::get() * 8, CAS_OPS);
 }
 
 fn run_multi_threaded(threads: usize, data_set_size: usize, cas_ops_count: usize) {
@@ -268,10 +263,10 @@ impl CasData {
 
 impl<'g> CasChange<'g> {
     fn generate_for(cas_data: &'g CasData, guard: &'g Guard) -> CasChange<'g> {
-        let field1 = cas_data.field_1.read(&guard);
-        let field2 = cas_data.field_2.read(&guard);
-        let field3 = cas_data.field_3.read(&guard);
-        let field4 = cas_data.field_4.read(&guard);
+        let field1 = cas_data.field_1.read(guard);
+        let field2 = cas_data.field_2.read(guard);
+        let field3 = cas_data.field_3.read(guard);
+        let field4 = cas_data.field_4.read(guard);
         CasChange {
             is_completed: false,
             field_1_orig_val: field1,
@@ -285,7 +280,7 @@ impl<'g> CasChange<'g> {
         }
     }
 
-    fn to_snapshot(&self) -> ChangeSnapshot {
+    fn to_snapshot(self) -> ChangeSnapshot {
         ChangeSnapshot {
             is_completed: self.is_completed,
             field_1_orig_val: *self.field_1_orig_val,

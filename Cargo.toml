@@ -19,3 +19,9 @@ crossbeam-epoch = "0.9.4"
 crossbeam-utils = "0.8.4"
 num_cpus = "1.11.1"
 rand = "0.8.3"
+criterion = "0.3.4"
+
+[[bench]]
+name = "mwcas_bench"
+path = "benches/bench.rs"
+harness = false

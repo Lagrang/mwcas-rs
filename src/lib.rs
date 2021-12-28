@@ -134,7 +134,7 @@ impl<T> Drop for HeapPointer<T> {
             drop(Box::from_raw(
                 // this heap pointer cannot be part of any running MwCAS,
                 // we can safely use crossbeam_epoch::unprotected()
-                self.read_ptr(&crossbeam_epoch::unprotected()),
+                self.read_ptr(crossbeam_epoch::unprotected()),
             ));
         }
     }
@@ -194,6 +194,12 @@ pub struct MwCas<'g> {
     success: AtomicBool,
     // Rc used to make this type !Send and !Sync,
     phantom: PhantomData<Rc<u8>>,
+}
+
+impl<'g> Default for MwCas<'g> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<'g> MwCas<'g> {
@@ -275,7 +281,7 @@ impl<'g> MwCas<'g> {
                 }
             }
         }
-        // TODO: move to static field
+
         let drop_fn: Box<dyn Fn(bool) + 'g> = Box::new(move |_| {});
         self.inner.cas_ops.push(Cas::new(
             &target.val as *const AtomicU64 as *mut AtomicU64,
@@ -361,16 +367,18 @@ impl<'g> MwCasInner<'g> {
 
     #[inline]
     fn update_status(&self, new_status: u8) -> u8 {
-        let prev_status =
-            self.status
-                .compare_and_swap(STATUS_PREPARE, new_status, Ordering::AcqRel);
-        if prev_status == STATUS_PREPARE {
-            new_status
-        } else {
+        if let Err(prev_status) = self.status.compare_exchange(
+            STATUS_PREPARE,
+            new_status,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             // if some other thread executed our MwCAS before us,
             // it already update status and we must not change it.
             // otherwise, we can execute same MwCAS with different result.
             prev_status
+        } else {
+            new_status
         }
     }
 
@@ -522,11 +530,14 @@ impl<'g> Cas<'g> {
         let cas_ptr = CasPointer::from_cas(self);
         loop {
             let prev_val = unsafe {
-                (*self.target_ptr).compare_and_swap(
-                    self.orig_val,
-                    cas_ptr.rdcss_addr(),
-                    Ordering::AcqRel,
-                )
+                (*self.target_ptr)
+                    .compare_exchange(
+                        self.orig_val,
+                        cas_ptr.rdcss_addr(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_or_else(|v| v, |v| v)
             };
 
             if let Some(found_cas_ptr) = CasPointer::from_rdcss(prev_val) {
@@ -562,7 +573,14 @@ impl<'g> Cas<'g> {
             _ => panic!("CAS cannot be completed for not prepared MWCAS"),
         };
         let expected_val = mwcas.poisoned();
-        unsafe { (*self.target_ptr).compare_and_swap(expected_val, new_val, Ordering::AcqRel) };
+        unsafe {
+            let _ = (*self.target_ptr).compare_exchange(
+                expected_val,
+                new_val,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        };
         // if CAS above failed, then some other thread completed our MwCAS,
         // e.g assist us. This is expected case, no additional actions required.
         // Or we found MwCas of installed by other thread. This is also expected
@@ -596,8 +614,14 @@ impl<'g> Cas<'g> {
             }
         };
         unsafe {
-            let prev =
-                (*cas.target_ptr).compare_and_swap(cas_ptr.rdcss_addr(), new_val, Ordering::AcqRel);
+            let prev = (*cas.target_ptr)
+                .compare_exchange(
+                    cas_ptr.rdcss_addr(),
+                    new_val,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_or_else(|v| v, |v| v);
             debug_assert_eq!(prev, cas_ptr.rdcss_addr())
         };
     }
