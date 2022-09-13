@@ -68,8 +68,11 @@ fn run_multi_threaded(threads: usize, data_set_size: usize, cas_ops_count: usize
             let handle = s.spawn(|_| {
                 let mut res = Vec::new();
                 let mut rng = thread_rng();
-                for _ in 0..cas_ops_count {
-                    let guard = crossbeam_epoch::pin();
+                let mut guard = crossbeam_epoch::pin();
+                for i in 0..cas_ops_count {
+                    if i % 10 == 0 {
+                        guard = crossbeam_epoch::pin();
+                    }
                     let cas_idx = rng.sample(uniform);
                     let cas_data = unsafe { &mut (*data_set.as_ptr())[cas_idx] };
                     let field1 = unsafe { NonNull::new_unchecked(&mut cas_data.field_1) };

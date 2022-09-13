@@ -111,12 +111,10 @@ impl<T> HeapPointer<T> {
 fn read_val(ptr: &AtomicU64, guard: &Guard) -> u64 {
     loop {
         let cur_val = ptr.load(Ordering::Acquire);
-        if CasPointer::from_rdcss(cur_val).is_none() {
-            if let Some(mwcas_ptr) = MwCasPointer::from_poisoned(cur_val, guard) {
-                mwcas_ptr.exec_internal(guard);
-            } else {
-                return cur_val;
-            }
+        if let Some(mwcas_ptr) = MwCasPointer::from_poisoned(cur_val, guard) {
+            mwcas_ptr.exec_internal(guard);
+        } else {
+            return cur_val;
         }
     }
 }
@@ -337,9 +335,14 @@ impl<'g> MwCasInner<'g> {
     #[inline]
     fn exec_internal(&self, guard: &Guard) -> bool {
         let phase_one_status = self.phase_one(guard);
-        let current_status = self.update_status(phase_one_status);
-        self.phase_two(current_status);
-        current_status == STATUS_COMPLETED
+        let phase_two_status = self.update_status(phase_one_status);
+        match phase_two_status {
+            Ok(status) => self.phase_two(status),
+            Err(cur_status) => {
+                self.phase_two(cur_status);
+            }
+        }
+        phase_two_status.map_or_else(|status| status, |status| status) == STATUS_COMPLETED
     }
 
     /// Phase 1 according to paper
@@ -366,7 +369,7 @@ impl<'g> MwCasInner<'g> {
     }
 
     #[inline]
-    fn update_status(&self, new_status: u8) -> u8 {
+    fn update_status(&self, new_status: u8) -> Result<u8, u8> {
         if let Err(prev_status) = self.status.compare_exchange(
             STATUS_PREPARE,
             new_status,
@@ -374,11 +377,22 @@ impl<'g> MwCasInner<'g> {
             Ordering::Acquire,
         ) {
             // if some other thread executed our MwCAS before us,
-            // it already update status and we must not change it.
-            // otherwise, we can execute same MwCAS with different result.
-            prev_status
+            // it already update status and we revert all changes.
+            // otherwise, we can overwrite results of completed MwCAS.
+            // Description from paper:
+            // Installation of a descriptor for a completed PMwCAS (p1) that might
+            // inadvertently overwrite the result of another PMwCAS (p2), where
+            // p2 should occur after p1. This can happen if a thread T executing p1
+            // is about to install a descriptor in a target address A over an existing
+            // value V, but goes to sleep. While T sleeps, another thread may complete p1
+            // (given the cooperative nature of PMwCAS ) and subsequently
+            // p2 executes to set a back to V. If T were to wake up and try to
+            // overwrite V (the value it expects) in address A, it would actually be
+            // overwriting the result of p2, violating the linearizable schedule for
+            // updates to A.
+            Err(prev_status)
         } else {
-            new_status
+            Ok(new_status)
         }
     }
 
@@ -447,13 +461,13 @@ impl<'g> Eq for MwCasPointer<'g> {}
 
 impl<'g> PartialEq for MwCasPointer<'g> {
     fn eq(&self, other: &MwCasPointer) -> bool {
-        std::ptr::eq(self.mwcas, other.mwcas)
+        ptr::eq(self.mwcas, other.mwcas)
     }
 }
 
 impl<'g> PartialEq<MwCasInner<'g>> for MwCasPointer<'g> {
     fn eq(&self, other: &MwCasInner) -> bool {
-        std::ptr::eq(self.mwcas, other)
+        ptr::eq(self.mwcas, other)
     }
 }
 
@@ -527,40 +541,20 @@ impl<'g> Cas<'g> {
 
     /// Try to install pointer to `MwCAS` into value of current CAS target.
     fn prepare<'a>(&self, mwcas: &MwCasInner, guard: &'a Guard) -> CasPrepareResult<'a> {
-        let cas_ptr = CasPointer::from_cas(self);
-        loop {
-            let prev_val = unsafe {
-                (*self.target_ptr)
-                    .compare_exchange(
-                        self.orig_val,
-                        cas_ptr.rdcss_addr(),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .map_or_else(|v| v, |v| v)
-            };
+        let new_val = MwCasPointer::from(mwcas.deref()).poisoned();
+        let prev = unsafe {
+            (*self.target_ptr)
+                .compare_exchange(self.orig_val, new_val, Ordering::AcqRel, Ordering::Acquire)
+                .map_or_else(|v| v, |v| v)
+        };
 
-            if let Some(found_cas_ptr) = CasPointer::from_rdcss(prev_val) {
-                if cas_ptr == found_cas_ptr {
-                    // some other thread already start our RDCSS phase, assist it.
-                    Self::install_mwcas_ptr(&cas_ptr, mwcas);
-                    break CasPrepareResult::Success;
-                }
-                // TODO: we should complete RDCSS of others too...
-                continue;
-            }
-
-            if let Some(mwcas_ptr) = MwCasPointer::from_poisoned(prev_val, guard) {
-                // found MWCAS pointer installed by some other
-                break CasPrepareResult::Conflict(mwcas_ptr);
-            }
-
-            if prev_val == self.orig_val {
-                Self::install_mwcas_ptr(&cas_ptr, mwcas);
-                break CasPrepareResult::Success;
-            }
-
-            break CasPrepareResult::Failed;
+        if prev == self.orig_val {
+            CasPrepareResult::Success
+        } else if let Some(mwcas_ptr) = MwCasPointer::from_poisoned(prev, guard) {
+            // found MWCAS pointer installed by some other
+            CasPrepareResult::Conflict(mwcas_ptr)
+        } else {
+            CasPrepareResult::Failed
         }
     }
 
@@ -585,89 +579,6 @@ impl<'g> Cas<'g> {
         // e.g assist us. This is expected case, no additional actions required.
         // Or we found MwCas of installed by other thread. This is also expected
         // case when we fail our MwCAS and some other MwCas install it pointer to same memory cell.
-    }
-
-    fn install_mwcas_ptr(cas_ptr: &CasPointer, mwcas: &MwCasInner) {
-        let cas = cas_ptr.as_ref();
-        let new_val = match mwcas.status() {
-            STATUS_PREPARE => MwCasPointer::from(mwcas.deref()).poisoned(),
-            _ => {
-                // rollback if someone already finish our MwCas or we found MwCas which already
-                // completed and it memory is freed.
-                //
-                // This branch also covers cases when our MwCas completed and other thread run
-                // MwCas which change same memory cells to the values equals to ours.
-                // Description from paper:
-                // Installation of a descriptor for a completed PMwCAS (p1) that might
-                // inadvertently overwrite the result of another PMwCAS (p2), where
-                // p2 should occur after p1. This can happen if a thread T executing p1
-                // is about to install a descriptor in a target address A over an existing
-                // value V, but goes to sleep. While T sleeps, another thread may complete p1
-                // (given the cooperative nature of PMwCAS ) and subsequently
-                // p2 executes to set a back to V. If T were to wake up and try to
-                // overwrite V (the value it expects) in address A, it would actually be
-                // overwriting the result of p2, violating the linearizable schedule for
-                // updates to A. Using RDCSS to install a descriptor ensures not only
-                // that the target word contains the expected value but also that the
-                // status is Undecided, i.e., that the operation is still in progress.
-                cas.orig_val
-            }
-        };
-        unsafe {
-            let prev = (*cas.target_ptr)
-                .compare_exchange(
-                    cas_ptr.rdcss_addr(),
-                    new_val,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .map_or_else(|v| v, |v| v);
-            debug_assert_eq!(prev, cas_ptr.rdcss_addr())
-        };
-    }
-}
-
-#[derive(Debug)]
-#[repr(transparent)]
-struct CasPointer {
-    cas_addr: u64,
-}
-
-impl<'a> CasPointer {
-    const RDCSS_FLAG: u64 = 0x8000_0000_0000_0000;
-
-    #[inline(always)]
-    fn from_cas(cas: &Cas) -> CasPointer {
-        CasPointer {
-            cas_addr: cas as *const Cas as u64,
-        }
-    }
-
-    #[inline(always)]
-    fn from_rdcss(rdcss_addr: u64) -> Option<CasPointer> {
-        if rdcss_addr & Self::RDCSS_FLAG > 0 {
-            let cas_addr = rdcss_addr | !Self::RDCSS_FLAG;
-            Some(CasPointer { cas_addr })
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    fn rdcss_addr(&self) -> u64 {
-        (self.cas_addr as u64) | Self::RDCSS_FLAG
-    }
-}
-
-impl<'g> AsRef<Cas<'g>> for CasPointer {
-    fn as_ref(&self) -> &Cas<'g> {
-        unsafe { &*(self.cas_addr as *const Cas) }
-    }
-}
-
-impl PartialEq for CasPointer {
-    fn eq(&self, other: &Self) -> bool {
-        self.cas_addr == other.cas_addr
     }
 }
 
@@ -748,7 +659,7 @@ mod tests {
             cas1.prepare(mwcas.inner.deref(), &guard);
             cas2.prepare(mwcas.inner.deref(), &guard);
 
-            assert_eq!(mwcas.exec(&guard), true);
+            assert!(mwcas.exec(&guard));
             assert_eq!(*val1.read(&guard), 2);
             assert_eq!(*val2.read(&guard), 3);
 
@@ -761,7 +672,7 @@ mod tests {
             let cas1 = mwcas.inner.cas_ops.last().unwrap();
             cas1.prepare(mwcas.inner.deref(), &guard);
 
-            assert_eq!(mwcas.exec(&guard), true);
+            assert!(mwcas.exec(&guard));
             assert_eq!(*val1.read(&guard), 3);
             assert_eq!(*val2.read(&guard), 4);
         }
@@ -787,9 +698,9 @@ mod tests {
 
             // at start, second MwCAS should complete first MwCAS
             // and then can successfully complete it's own operations.
-            assert_eq!(mwcas2.exec(&guard), true);
+            assert!(mwcas2.exec(&guard));
             assert_eq!(*val3.read(&guard), 4);
-            assert_eq!(mwcas1.exec(&guard), true);
+            assert!(mwcas1.exec(&guard));
             assert_eq!(*val1.read(&guard), 2);
             assert_eq!(*val2.read(&guard), 3);
         }
@@ -805,19 +716,19 @@ mod tests {
             let mut mwcas2 = MwCas::new();
             let val1_ref = val1.read(&guard);
             unsafe {
-                mwcas1.compare_exchange(&mut *value1.as_ptr(), val1_ref, 2);
-                mwcas1.compare_exchange(&mut *value2.as_ptr(), val1_ref, 2);
+                mwcas1.compare_exchange(&*value1.as_ptr(), val1_ref, 2);
+                mwcas1.compare_exchange(&*value2.as_ptr(), val1_ref, 2);
             }
             assert_eq!(mwcas1.inner.phase_one(&guard), STATUS_FAILED);
-            mwcas1.inner.update_status(STATUS_FAILED);
+            mwcas1.inner.update_status(STATUS_FAILED).unwrap();
 
             // this cause assist to mwcas-1 which already on fail path
             unsafe {
-                mwcas2.compare_exchange(&mut *value1.as_ptr(), val1_ref, 2);
+                mwcas2.compare_exchange(&*value1.as_ptr(), val1_ref, 2);
             }
-            assert_eq!(mwcas2.exec(&guard), true);
+            assert!(mwcas2.exec(&guard));
             assert_eq!(mwcas1.inner.status(), STATUS_FAILED);
-            assert_eq!(mwcas1.exec(&guard), false);
+            assert!(!mwcas1.exec(&guard));
 
             assert_eq!(*val1.read(&guard), 2);
             assert_eq!(*val2.read(&guard), 2);
@@ -836,9 +747,9 @@ mod tests {
             let mut mwcas1 = MwCas::new();
             let mut mwcas2 = MwCas::new();
             unsafe {
-                mwcas1.compare_exchange(&mut *value1.as_ptr(), val1.read(&guard), 2);
-                mwcas1.compare_exchange(&mut *value2.as_ptr(), val2.read(&guard), 3);
-                mwcas2.compare_exchange(&mut *value3.as_ptr(), val3.read(&guard), 4);
+                mwcas1.compare_exchange(&*value1.as_ptr(), val1.read(&guard), 2);
+                mwcas1.compare_exchange(&*value2.as_ptr(), val2.read(&guard), 3);
+                mwcas2.compare_exchange(&*value3.as_ptr(), val3.read(&guard), 4);
             }
 
             // start phase 1 of 1st mwcas
@@ -869,15 +780,15 @@ mod tests {
             let mut val2 = HeapPointer::new(2);
             let value2 = unsafe { NonNull::new_unchecked(&mut val2) };
             unsafe {
-                mwcas1.compare_exchange(&mut *value1.as_ptr(), &1, 2);
-                mwcas1.compare_exchange(&mut *value2.as_ptr(), &2, 3);
-                mwcas2.compare_exchange(&mut *value2.as_ptr(), &3, 4);
+                mwcas1.compare_exchange(&*value1.as_ptr(), &1, 2);
+                mwcas1.compare_exchange(&*value2.as_ptr(), &2, 3);
+                mwcas2.compare_exchange(&*value2.as_ptr(), &3, 4);
             }
 
             let guard = crossbeam_epoch::pin();
             // start phase 1 of 1st mwcas
             let status = mwcas1.inner.phase_one(&guard);
-            mwcas1.inner.update_status(status);
+            mwcas1.inner.update_status(status).unwrap();
             // execute 2nd mwcas which should find conflicting 1st MwCAS in value2,
             // assist it and complete both MwCASs
             mwcas2.exec(&guard);
@@ -900,10 +811,10 @@ mod tests {
             let mut mwcas1 = MwCas::new();
             let mut mwcas2 = MwCas::new();
             unsafe {
-                mwcas1.compare_exchange(&mut *value1.as_ptr(), val1.read(&guard), 2);
-                mwcas1.compare_exchange(&mut *value2.as_ptr(), val2.read(&guard), 3);
+                mwcas1.compare_exchange(&*value1.as_ptr(), val1.read(&guard), 2);
+                mwcas1.compare_exchange(&*value2.as_ptr(), val2.read(&guard), 3);
                 // emulate race with 2nd MwCAS on same value
-                mwcas2.compare_exchange(&mut *value2.as_ptr(), val2.read(&guard), 4);
+                mwcas2.compare_exchange(&*value2.as_ptr(), val2.read(&guard), 4);
             }
 
             let cas = mwcas1.inner.cas_ops.first().unwrap();
@@ -915,7 +826,7 @@ mod tests {
 
             // try complete 1st MwCAS which should fail because 2nd already
             // update expected field value
-            assert_eq!(mwcas1.exec(&guard), false);
+            assert!(!mwcas1.exec(&guard));
         }
 
         #[test]
@@ -929,10 +840,10 @@ mod tests {
             let mut val2 = HeapPointer::new(2);
             let value2 = unsafe { NonNull::new_unchecked(&mut val2) };
             unsafe {
-                mwcas1.compare_exchange(&mut *value1.as_ptr(), &1, 2);
-                mwcas1.compare_exchange(&mut *value2.as_ptr(), &2, 3);
-                mwcas2.compare_exchange(&mut *value1.as_ptr(), &2, 1);
-                mwcas2.compare_exchange(&mut *value2.as_ptr(), &3, 2);
+                mwcas1.compare_exchange(&*value1.as_ptr(), &1, 2);
+                mwcas1.compare_exchange(&*value2.as_ptr(), &2, 3);
+                mwcas2.compare_exchange(&*value1.as_ptr(), &2, 1);
+                mwcas2.compare_exchange(&*value2.as_ptr(), &3, 2);
             }
 
             let guard = crossbeam_epoch::pin();
@@ -941,10 +852,10 @@ mod tests {
 
             // 2nd MwCAS will assist to 1st MwCAS, complete itself(rollback
             // all fields to original values)
-            assert_eq!(mwcas2.exec(&guard), true);
+            assert!(mwcas2.exec(&guard));
             // 1st MwCAS should skip all field updates because someone already done it's work
             // and revert field values back
-            assert_eq!(mwcas1.exec(&guard), true);
+            assert!(mwcas1.exec(&guard));
 
             assert_eq!(*val1.read(&guard), 1);
             assert_eq!(*val2.read(&guard), 2);
@@ -957,7 +868,7 @@ mod tests {
             let guard = crossbeam_epoch::pin();
             let mut mwcas = MwCas::new();
             unsafe {
-                mwcas.compare_exchange(&mut *value.as_ptr(), val.read(&guard), 2);
+                mwcas.compare_exchange(&*value.as_ptr(), val.read(&guard), 2);
             }
 
             assert_eq!(*val.read(&guard), 1);
@@ -1101,7 +1012,7 @@ mod tests {
         fn test_cas_completion_with_invalid_status() {
             let mut value = HeapPointer::new(1);
             let mut mwcas = MwCas::new();
-            mwcas.compare_exchange(&mut value, &1, 2);
+            mwcas.compare_exchange(&value, &1, 2);
             let cas = mwcas.inner.cas_ops.first().unwrap();
             cas.complete(u8::MAX, &MwCasPointer::from(mwcas.inner.deref()));
         }
