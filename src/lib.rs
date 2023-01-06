@@ -12,9 +12,9 @@
 //! memory) and only covers DRAM multi-word CAS.
 //!
 //! # Platform support
-//! Currently, [`MwCas`] supports only x86_64 platform because it exploits platform specific hacks:
+//! Currently, [`MwCas`] supports only x86_64 and ARMv8 platforms because it exploits platform specific hacks:
 //! MwCas use upper 3 bit of pointer's virtual address to representing internal state. Today x86_64
-//! CPUs use lower 48 bits of virtual address, other 16 bits are 0. Usage of upper 3 bits
+//! and ARMv8 CPUs use lower 48 bits of virtual address, other 16 bits are 0. Usage of upper 3 bits
 //! described in paper.
 //!
 //! # Usage
@@ -184,7 +184,7 @@ unsafe impl Sync for U64Pointer {}
 /// [`MwCas`] provides `compare and exchange` operations to register CAS operations on pointers.
 /// When all `compare and exchange` operations registered, caller should execute `exec` method to
 /// actually perform multi-word CAS.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub struct MwCas<'g> {
     // allocated on heap to be safely accessible by 'assisting' threads.
     inner: Box<MwCasInner<'g>>,

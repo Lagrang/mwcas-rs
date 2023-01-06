@@ -17,9 +17,9 @@ Current implementation doesn't provide features for non-volatile
 memory(persistent memory) and only covers DRAM multi-word CAS.
 
 ## Platform support
-Currently, `MwCas` supports only x86_64 platform because it exploits
+Currently, `MwCas` supports only x86_64 and ARMv8 platforms because it exploits
 platform specific hacks: `MwCas` use upper 3 bit of pointer's virtual
-address to representing internal state. Today x86_64 CPUs use lower 48
+address to representing internal state. Today x86_64 and ARMv8 CPUs use lower 48
 bits of virtual address, other 16 bits are 0. Usage of upper 3 bits
 described in paper.
 
